@@ -1,0 +1,27 @@
+name: wa_shield
+description: "Secure Offline Anti-Delete & Media Recovery Utility."
+publish_to: 'none'
+version: 2.0.0+2
+
+environment:
+  sdk: '>=3.2.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  notification_listener_service: ^0.3.4
+  sqflite_sqlcipher: ^3.1.0+1          # AES-256 Encrypted SQLite
+  flutter_secure_storage: ^9.2.2       # Android Hardware Keystore
+  local_auth: ^2.3.0                   # Fingerprint / Face / PIN Lock
+  path_provider: ^2.1.2
+  path: ^1.9.0
+  permission_handler: ^11.3.0
+  intl: ^0.19.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^3.0.0
+
+flutter:
+  uses-material-design: true
