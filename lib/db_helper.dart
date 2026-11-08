@@ -74,8 +74,9 @@ class DBHelper {
     return await openDatabase(
       path,
       password: encryptionPassword, // AES-256 SQLCipher Encryption Active
-      version: 1,
+      version: 2,
       onCreate: _createDB,
+      onUpgrade: _upgradeDB,
     );
   }
 
@@ -122,6 +123,29 @@ class DBHelper {
         media_type TEXT NOT NULL,
         timestamp INTEGER NOT NULL,
         is_deleted_by_sender INTEGER NOT NULL DEFAULT 0
+      )
+    ''');
+
+    await _createStatusVaultTable(db);
+  }
+
+  /// Non-destructive migrations. Existing tables and rows are never dropped.
+  Future<void> _upgradeDB(Database db, int oldVersion, int newVersion) async {
+    if (oldVersion < 2) {
+      await _createStatusVaultTable(db);
+    }
+  }
+
+  Future<void> _createStatusVaultTable(DatabaseExecutor db) async {
+    await db.execute('''
+      CREATE TABLE IF NOT EXISTS status_vault (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        file_name TEXT NOT NULL UNIQUE,
+        saved_path TEXT NOT NULL,
+        media_type TEXT NOT NULL,
+        source_pkg TEXT NOT NULL,
+        original_mtime INTEGER NOT NULL,
+        saved_at INTEGER NOT NULL
       )
     ''');
   }
@@ -218,10 +242,80 @@ class DBHelper {
     return await db.query('media_vault', orderBy: 'timestamp DESC');
   }
 
+  // ---------------------------------------------------------------------------
+  // Status vault
+  // ---------------------------------------------------------------------------
+
+  /// Inserts a saved status. Returns the new row id, or null if a row with the
+  /// same file_name already exists (idempotent save).
+  Future<int?> insertSavedStatus({
+    required String fileName,
+    required String savedPath,
+    required String mediaType,
+    required String sourcePkg,
+    required int originalMtime,
+  }) async {
+    final db = await instance.database;
+    final id = await db.insert(
+      'status_vault',
+      {
+        'file_name': fileName,
+        'saved_path': savedPath,
+        'media_type': mediaType,
+        'source_pkg': sourcePkg,
+        'original_mtime': originalMtime,
+        'saved_at': DateTime.now().millisecondsSinceEpoch,
+      },
+      conflictAlgorithm: ConflictAlgorithm.ignore,
+    );
+    return id > 0 ? id : null;
+  }
+
+  Future<bool> isStatusSaved(String fileName) async {
+    final db = await instance.database;
+    final res = await db.query(
+      'status_vault',
+      columns: ['id'],
+      where: 'file_name = ?',
+      whereArgs: [fileName],
+      limit: 1,
+    );
+    return res.isNotEmpty;
+  }
+
+  Future<Set<String>> fetchSavedStatusFileNames() async {
+    final db = await instance.database;
+    final res = await db.query('status_vault', columns: ['file_name']);
+    return res.map((r) => r['file_name'] as String).toSet();
+  }
+
+  Future<List<Map<String, dynamic>>> fetchSavedStatuses() async {
+    final db = await instance.database;
+    return await db.query('status_vault', orderBy: 'saved_at DESC, id DESC');
+  }
+
+  Future<Map<String, dynamic>?> fetchSavedStatusById(int id) async {
+    final db = await instance.database;
+    final res = await db.query('status_vault', where: 'id = ?', whereArgs: [id], limit: 1);
+    return res.isEmpty ? null : res.first;
+  }
+
+  Future<int> deleteSavedStatus(int id) async {
+    final db = await instance.database;
+    return await db.delete('status_vault', where: 'id = ?', whereArgs: [id]);
+  }
+
+  Future<int> countSavedStatuses() async {
+    final db = await instance.database;
+    final res = await db.rawQuery('SELECT COUNT(*) AS c FROM status_vault');
+    return (res.first['c'] as int?) ?? 0;
+  }
+
   Future<void> clearAllData() async {
     final db = await instance.database;
     await db.delete('messages');
     await db.delete('media_vault');
+    await db.delete('status_vault');
   }
 }
 
