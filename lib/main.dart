@@ -8,6 +8,8 @@ import 'package:notification_listener_service/notification_listener_service.dart
 import 'package:permission_handler/permission_handler.dart';
 import 'db_helper.dart';
 import 'media_watcher.dart';
+import 'status_saver.dart';
+import 'status_screen.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -183,6 +185,9 @@ class HomeScreen extends StatefulWidget {
 class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateMixin {
   late TabController _tabController;
   final MediaWatcherService _mediaWatcher = MediaWatcherService();
+  final StatusSaverService _statusSaver = StatusSaverService();
+  final GlobalKey<StatusScreenState> _statusKey = GlobalKey<StatusScreenState>();
+  int _savedStatusCount = 0;
 
   List<Map<String, dynamic>> _allMessages = [];
   List<Map<String, dynamic>> _deletedMessages = [];
@@ -192,6 +197,9 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
 
   bool _hasNotifPerm = false;
   bool _hasStoragePerm = false;
+  // Status Saver needs "All files access": WhatsApp's hidden .Statuses folder
+  // is not readable with the photos permission alone.
+  bool _hasAllFilesAccess = false;
   bool _listenerStarted = false;
   bool _dbError = false; // true when the encrypted vault could not be opened
 
@@ -214,13 +222,14 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
   @override
   void initState() {
     super.initState();
-    _tabController = TabController(length: 3, vsync: this);
+    _tabController = TabController(length: 4, vsync: this);
     _checkPermissionsAndStart();
     _refreshLists();
   }
 
   Future<void> _checkPermissionsAndStart() async {
     _hasNotifPerm = await NotificationListenerService.isPermissionGranted();
+    _hasAllFilesAccess = await Permission.manageExternalStorage.isGranted;
 
     if (await Permission.manageExternalStorage.isGranted || await Permission.photos.isGranted) {
       _hasStoragePerm = true;
@@ -285,11 +294,13 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
       final all = await DBHelper.instance.fetchMessages(onlyDeleted: false);
       final del = await DBHelper.instance.fetchMessages(onlyDeleted: true);
       final media = await DBHelper.instance.fetchMedia();
+      final statusCount = await DBHelper.instance.countSavedStatuses();
       if (mounted) {
         setState(() {
           _allMessages = all;
           _deletedMessages = del;
           _mediaList = media;
+          _savedStatusCount = statusCount;
           _dbError = false;
         });
       }
@@ -338,7 +349,11 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
       try {
         await _mediaWatcher.deleteAllBackedUpMedia();
       } catch (_) {}
+      try {
+        await _statusSaver.deleteAllSavedStatusFiles();
+      } catch (_) {}
       await _refreshLists();
+      await _statusKey.currentState?.reload();
     } catch (e) {
       debugPrint("WA Shield: vault reset failed: $e");
     }
@@ -351,8 +366,8 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
             backgroundColor: const Color(0xFF1F2C34),
             title: const Text("Wipe Local Vault?", style: TextStyle(fontSize: 16)),
             content: const Text(
-              "This permanently deletes all recovered messages and backed-up media "
-              "from this device. This cannot be undone.",
+              "This permanently deletes all recovered messages, backed-up media and "
+              "saved statuses from this device. This cannot be undone.",
               style: TextStyle(color: Colors.grey, fontSize: 13),
             ),
             actions: [
@@ -376,11 +391,14 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
     // just their DB rows), then clear the DB. Report honestly if anything could
     // not be removed instead of always claiming success.
     bool mediaFullyRemoved = true;
+    bool statusesFullyRemoved = true;
     try {
       _mediaWatcher.stopWatching();
       mediaFullyRemoved = await _mediaWatcher.deleteAllBackedUpMedia();
+      statusesFullyRemoved = await _statusSaver.deleteAllSavedStatusFiles();
       await DBHelper.instance.clearAllData();
       await _refreshLists();
+      await _statusKey.currentState?.reload();
     } catch (e) {
       debugPrint("WA Shield: wipe failed: $e");
       if (mounted) {
@@ -399,9 +417,13 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
     if (mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text(mediaFullyRemoved
+          content: Text(mediaFullyRemoved && statusesFullyRemoved
               ? "Vault wiped."
-              : "Vault wiped, but some media files could not be deleted."),
+              : !statusesFullyRemoved && !mediaFullyRemoved
+                  ? "Vault wiped, but some media and status files could not be deleted."
+                  : !statusesFullyRemoved
+                      ? "Vault wiped, but some status files could not be deleted."
+                      : "Vault wiped, but some media files could not be deleted."),
         ),
       );
     }
@@ -478,10 +500,13 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
         bottom: TabBar(
           controller: _tabController,
           indicatorColor: const Color(0xFF00A884),
+          isScrollable: true,
+          tabAlignment: TabAlignment.start,
           tabs: [
             Tab(text: "Ghost Feed (${_allMessages.length})"),
             Tab(text: "Deleted (${_deletedMessages.length})"),
             Tab(text: "Media (${_mediaList.length})"),
+            Tab(text: "Status ($_savedStatusCount)"),
           ],
         ),
       ),
@@ -538,6 +563,16 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
                 _buildMessageList(_allMessages),
                 _buildMessageList(_deletedMessages),
                 _buildMediaGrid(),
+                StatusScreen(
+                  key: _statusKey,
+                  hasStoragePerm: _hasAllFilesAccess,
+                  onRequestPermission: _requestPermissions,
+                  onSavedCountChanged: (n) {
+                    if (mounted && n != _savedStatusCount) setState(() => _savedStatusCount = n);
+                  },
+                  tabController: _tabController,
+                  tabIndex: 3,
+                ),
               ],
             ),
           ),
