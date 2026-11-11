@@ -17,6 +17,7 @@ dependencies:
   path: ^1.9.0
   permission_handler: ^11.3.0
   intl: ^0.19.0
+  video_player: ^2.14.1
 
 dev_dependencies:
   flutter_test:
