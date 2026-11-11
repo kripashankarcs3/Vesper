@@ -1,70 +1,62 @@
-import 'dart:convert';
-import 'dart:math';
+import 'dart:io';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:sqflite_sqlcipher/sqflite.dart';
 import 'package:path/path.dart';
+import 'vault_key.dart';
 
 class DBHelper {
   static final DBHelper instance = DBHelper._init();
   static Database? _database;
+  static Future<Database>? _opening;
 
-  // Hardware-backed Encrypted SharedPreferences
+  // Hardware-backed Encrypted SharedPreferences.
+  // IMPORTANT: these options and the key name MUST stay exactly as they are —
+  // existing installs keep their vault key under them. resetOnError must stay
+  // false: the plugin would otherwise deleteAll() (i.e. destroy the key) on any
+  // read error.
   static const _secureStorage = FlutterSecureStorage(
-    aOptions: AndroidOptions(encryptedSharedPreferences: true),
+    aOptions: AndroidOptions(encryptedSharedPreferences: true, resetOnError: false),
   );
   static const _dbKeyName = 'wa_shield_sqlcipher_master_key_v1';
+  static const _dbFileName = 'wa_shield_vault_encrypted.db';
+
+  late final VaultKeyProvider _keyProvider = VaultKeyProvider(
+    read: () => _secureStorage.read(key: _dbKeyName),
+    write: (v) => _secureStorage.write(key: _dbKeyName, value: v),
+    dbFileExists: () async => File(await _dbFilePath()).exists(),
+  );
 
   DBHelper._init();
 
-  Future<Database> get database async {
-    if (_database != null) return _database!;
-    _database = await _initDB('wa_shield_vault_encrypted.db');
-    return _database!;
+  Future<String> _dbFilePath() async => join(await getDatabasesPath(), _dbFileName);
+
+  /// Single-flight open. Many callers (initState refresh, media watcher, status
+  /// screen, notification stream) hit this concurrently at startup; previously
+  /// each ran its own _initDB, and on first run two of them could each mint a
+  /// different key — the DB got created with one key while storage kept the
+  /// other, so the vault became unreadable on the next cold start. A failed
+  /// open is not cached, so a later access retries.
+  Future<Database> get database {
+    final db = _database;
+    if (db != null) return Future.value(db);
+    final pending = _opening;
+    if (pending != null) return pending;
+    final future = _initDB().then((opened) {
+      _database = opened;
+      return opened;
+    });
+    _opening = future;
+    future.then((_) {}, onError: (Object _) {}).whenComplete(() {
+      if (identical(_opening, future)) _opening = null;
+    });
+    return future;
   }
 
-  static const _dbFileName = 'wa_shield_vault_encrypted.db';
-
-  // Generate or retrieve 256-bit cryptographic random key from Android Keystore.
-  Future<String> _getOrCreateEncryptionKey() async {
-    // Read the existing key, retrying transient Keystore/secure-storage glitches.
-    // CRITICAL: a read that merely FAILS must never cause us to delete or
-    // regenerate the stored key — doing so would make the existing encrypted
-    // vault permanently unreadable. We only create a new key when a successful
-    // read proves the key is genuinely absent (first run / explicitly reset).
-    Object? lastError;
-    for (int attempt = 0; attempt < 3; attempt++) {
-      try {
-        final existingKey = await _secureStorage.read(key: _dbKeyName);
-        if (existingKey != null && existingKey.isNotEmpty) {
-          return existingKey;
-        }
-        // Read succeeded, key is genuinely absent -> create and PERSIST one.
-        // If the write fails we must not return an unpersisted key (the next
-        // launch could not reopen the DB), so let the error propagate/retry.
-        final newKey = _generateKey();
-        await _secureStorage.write(key: _dbKeyName, value: newKey);
-        return newKey;
-      } catch (e) {
-        lastError = e;
-        await Future.delayed(const Duration(milliseconds: 200));
-      }
-    }
-    // Persistently unavailable: fail initialization rather than silently
-    // regenerate the key or proceed with an unpersisted one. The caller surfaces
-    // this as a recoverable error state (no data is touched or destroyed).
-    throw StateError('WA Shield: encryption key unavailable ($lastError)');
-  }
-
-  String _generateKey() {
-    final random = Random.secure();
-    final keyBytes = List<int>.generate(32, (_) => random.nextInt(256));
-    return base64UrlEncode(keyBytes);
-  }
-
-  Future<Database> _initDB(String filePath) async {
-    final dbPath = await getDatabasesPath();
-    final path = join(dbPath, filePath);
-    final encryptionPassword = await _getOrCreateEncryptionKey();
+  Future<Database> _initDB() async {
+    final path = await _dbFilePath();
+    // Fail-safe key lookup (see vault_key.dart): a new key is created ONLY when
+    // the DB file does not exist; a missing key for an existing vault throws.
+    final encryptionPassword = await _keyProvider.obtainKey();
 
     // Open the vault. We do NOT delete or recreate it on failure: a transient
     // I/O or Keystore fault must never destroy an otherwise-recoverable
@@ -82,6 +74,13 @@ class DBHelper {
 
   /// Closes any open handle so the next access reopens from disk.
   Future<void> close() async {
+    // Let an in-flight open finish first so its handle is not leaked.
+    final pending = _opening;
+    if (pending != null) {
+      try {
+        await pending;
+      } catch (_) {}
+    }
     final db = _database;
     _database = null;
     if (db != null) {
@@ -96,11 +95,12 @@ class DBHelper {
   /// user has explicitly confirmed, never automatically on an open failure.
   Future<void> resetVault() async {
     await close();
-    final dbPath = await getDatabasesPath();
-    final path = join(dbPath, _dbFileName);
+    final path = await _dbFilePath();
     try {
       await deleteDatabase(path);
     } catch (_) {}
+    // The stored key is kept; with the DB gone, the next open reuses it.
+    _keyProvider.invalidate();
   }
 
   Future<void> _createDB(Database db, int version) async {
