@@ -1,11 +1,11 @@
 {
-    "name": "wa_shield",
-    "short_name": "wa_shield",
+    "name": "Vesper",
+    "short_name": "Vesper",
     "start_url": ".",
     "display": "standalone",
     "background_color": "#0175C2",
     "theme_color": "#0175C2",
-    "description": "A new Flutter project.",
+    "description": "Vesper - offline, privacy-first companion for WhatsApp.",
     "orientation": "portrait-primary",
     "prefer_related_applications": false,
     "icons": [

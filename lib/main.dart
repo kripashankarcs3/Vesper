@@ -13,16 +13,16 @@ import 'status_screen.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
-  runApp(const WAShieldApp());
+  runApp(const VesperApp());
 }
 
-class WAShieldApp extends StatelessWidget {
-  const WAShieldApp({super.key});
+class VesperApp extends StatelessWidget {
+  const VesperApp({super.key});
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'WA Shield',
+      title: 'Vesper',
       debugShowCheckedModeBanner: false,
       theme: ThemeData.dark().copyWith(
         scaffoldBackgroundColor: const Color(0xFF0B141A),
@@ -93,7 +93,7 @@ class _BiometricAuthGateState extends State<BiometricAuthGate> with WidgetsBindi
       }
 
       final bool didAuthenticate = await _auth.authenticate(
-        localizedReason: 'Authenticate to unlock your encrypted WA Shield Vault',
+        localizedReason: 'Authenticate to unlock Vesper',
         options: const AuthenticationOptions(
           stickyAuth: true,
           biometricOnly: false, // Allows Fingerprint, Face Unlock, or Device PIN
@@ -142,10 +142,10 @@ class _BiometricAuthGateState extends State<BiometricAuthGate> with WidgetsBindi
                   child: Column(
                     mainAxisAlignment: MainAxisAlignment.center,
                     children: [
-                      const Icon(Icons.fingerprint, size: 88, color: Color(0xFF00A884)),
+                      Image.asset('assets/branding/logo_mark.png', width: 96, height: 96),
                       const SizedBox(height: 20),
                       const Text(
-                        "WA Shield Vault Locked",
+                        "Vesper is locked",
                         style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold),
                       ),
                       const SizedBox(height: 8),
@@ -308,7 +308,7 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
       // The vault could not be opened (wrong key / corruption / Keystore
       // unavailable). Surface a RECOVERABLE error state — never silently destroy
       // the on-disk data. The user is offered an explicit reset (see banner).
-      debugPrint("WA Shield: failed to read vault: $e");
+      debugPrint("Vesper: failed to read vault: $e");
       if (mounted) {
         setState(() => _dbError = true);
       }
@@ -355,7 +355,7 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
       await _refreshLists();
       await _statusKey.currentState?.reload();
     } catch (e) {
-      debugPrint("WA Shield: vault reset failed: $e");
+      debugPrint("Vesper: vault reset failed: $e");
     }
   }
 
@@ -400,7 +400,7 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
       await _refreshLists();
       await _statusKey.currentState?.reload();
     } catch (e) {
-      debugPrint("WA Shield: wipe failed: $e");
+      debugPrint("Vesper: wipe failed: $e");
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(content: Text("Wipe incomplete — some data could not be removed.")),
@@ -475,11 +475,11 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Row(
+        title: Row(
           children: [
-            Icon(Icons.enhanced_encryption, color: Color(0xFF00A884)),
-            SizedBox(width: 8),
-            Text("WA Shield Vault", style: TextStyle(fontWeight: FontWeight.bold)),
+            Image.asset('assets/branding/logo_mark.png', width: 26, height: 26),
+            const SizedBox(width: 8),
+            const Text("Vesper", style: TextStyle(fontWeight: FontWeight.bold)),
           ],
         ),
         actions: [

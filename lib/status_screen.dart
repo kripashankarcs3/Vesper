@@ -221,7 +221,7 @@ class StatusScreenState extends State<StatusScreen> {
       return _EmptyState(
         icon: Icons.folder_off_outlined,
         title: 'Storage access needed',
-        message: 'To show statuses, WA Shield needs "All files access" so it can read '
+        message: 'To show statuses, Vesper needs "All files access" so it can read '
             'the WhatsApp .Statuses folder on this device. Files are only read locally; '
             'nothing leaves the phone.',
         action: ElevatedButton.icon(
@@ -518,7 +518,7 @@ class _StatusViewerPageState extends State<StatusViewerPage> {
 
   Future<void> _export() => _run(() async {
         final ok = await _service.exportToGallery(_path);
-        _snack(ok ? 'Exported to Pictures/WA Shield Status.' : 'Export failed.');
+        _snack(ok ? 'Exported to Pictures/Vesper.' : 'Export failed.');
       });
 
   Future<void> _delete() async {
