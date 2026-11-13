@@ -143,7 +143,7 @@ class StatusSaverService {
 
   static const MethodChannel _scannerChannel = MethodChannel('wa_shield/media_scanner');
 
-  static const String exportDirPath = '/storage/emulated/0/Pictures/WA Shield Status';
+  static const String exportDirPath = '/storage/emulated/0/Pictures/Vesper';
 
   /// (directory, source package) pairs that may hold WhatsApp statuses.
   static const List<(String, String)> statusSources = [
@@ -283,7 +283,7 @@ class StatusSaverService {
     return true;
   }
 
-  /// Explicit user action: copies [path] to public Pictures/WA Shield Status and
+  /// Explicit user action: copies [path] to public Pictures/Vesper and
   /// asks the media scanner to index it. Returns true on success.
   Future<bool> exportToGallery(String path) async {
     try {
