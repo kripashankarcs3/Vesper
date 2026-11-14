@@ -9,7 +9,6 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
-  notification_listener_service: ^0.3.4
   sqflite_sqlcipher: ^3.1.0+1          # AES-256 Encrypted SQLite
   flutter_secure_storage: ^9.2.2       # Android Hardware Keystore
   local_auth: ^2.3.0                   # Fingerprint / Face / PIN Lock

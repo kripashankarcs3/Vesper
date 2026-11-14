@@ -1,11 +1,11 @@
+import 'dart:async';
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:intl/intl.dart';
 import 'package:local_auth/local_auth.dart';
-import 'package:notification_listener_service/notification_event.dart';
-import 'package:notification_listener_service/notification_listener_service.dart';
 import 'package:permission_handler/permission_handler.dart';
+import 'capture_bridge.dart';
 import 'db_helper.dart';
 import 'media_watcher.dart';
 import 'status_saver.dart';
@@ -182,7 +182,8 @@ class HomeScreen extends StatefulWidget {
   State<HomeScreen> createState() => _HomeScreenState();
 }
 
-class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateMixin {
+class _HomeScreenState extends State<HomeScreen>
+    with SingleTickerProviderStateMixin, WidgetsBindingObserver {
   late TabController _tabController;
   final MediaWatcherService _mediaWatcher = MediaWatcherService();
   final StatusSaverService _statusSaver = StatusSaverService();
@@ -193,59 +194,65 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
   List<Map<String, dynamic>> _deletedMessages = [];
   List<Map<String, dynamic>> _mediaList = [];
 
-  final Map<String, ServiceNotificationEvent> _replyCache = {};
+  /// Chat keys for which the native listener holds a live reply action.
+  Set<String> _replyableChats = {};
+  StreamSubscription<void>? _captureSub;
 
   bool _hasNotifPerm = false;
   bool _hasStoragePerm = false;
   // Status Saver needs "All files access": WhatsApp's hidden .Statuses folder
   // is not readable with the photos permission alone.
   bool _hasAllFilesAccess = false;
-  bool _listenerStarted = false;
   bool _dbError = false; // true when the encrypted vault could not be opened
-
-  final List<String> _deleteTriggers = [
-    "this message was deleted",
-    "🗑️ this message was deleted",
-    "you deleted this message",
-    "यह संदेश हटा दिया गया",
-  ];
-
-  final List<String> _ignorePatterns = [
-    "new messages",
-    "checking for new messages",
-    "whatsapp web is currently active",
-    "backing up messages",
-    "calling…",
-    "ongoing voice call",
-  ];
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _tabController = TabController(length: 4, vsync: this);
+    // Live pings from the native listener while the engine runs.
+    _captureSub = CaptureBridge.changes.listen((_) => _drainAndRefresh());
     _checkPermissionsAndStart();
-    _refreshLists();
+    _drainAndRefresh();
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _captureSub?.cancel();
+    _tabController.dispose();
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      // Back in the foreground: re-check access (the user may have just granted
+      // it in Settings) and drain whatever was captured in the background.
+      _checkPermissionsAndStart();
+      _drainAndRefresh();
+    }
   }
 
   Future<void> _checkPermissionsAndStart() async {
-    _hasNotifPerm = await NotificationListenerService.isPermissionGranted();
+    _hasNotifPerm = await CaptureBridge.isListenerEnabled();
     _hasAllFilesAccess = await Permission.manageExternalStorage.isGranted;
+    _hasStoragePerm = _hasAllFilesAccess || await Permission.photos.isGranted;
 
-    if (await Permission.manageExternalStorage.isGranted || await Permission.photos.isGranted) {
-      _hasStoragePerm = true;
-      await _mediaWatcher.startWatching(onMediaUpdate: _refreshLists);
+    if (_hasStoragePerm) {
+      await _mediaWatcher.startWatching();
     }
-
-    if (_hasNotifPerm && !_listenerStarted) {
-      _listenerStarted = true;
-      _listenToNotifications();
+    if (_hasNotifPerm) {
+      // Make sure the system has our listener bound (e.g. after an update).
+      await CaptureBridge.requestRebind();
     }
     if (mounted) setState(() {});
   }
 
   Future<void> _requestPermissions() async {
     if (!_hasNotifPerm) {
-      await NotificationListenerService.requestPermission();
+      // Opens the system notification-access screen; re-checked on resume.
+      await CaptureBridge.openListenerSettings();
     }
     if (!_hasStoragePerm) {
       await Permission.manageExternalStorage.request();
@@ -254,39 +261,16 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
     await _checkPermissionsAndStart();
   }
 
-  void _listenToNotifications() {
-    NotificationListenerService.notificationsStream.listen((ServiceNotificationEvent event) async {
-      if (event.hasRemoved == true) return;
-
-      final pkg = event.packageName ?? "";
-      if (pkg != "com.whatsapp" && pkg != "com.whatsapp.w4b") return;
-
-      final sender = (event.title ?? "").trim();
-      final content = (event.content ?? "").trim();
-
-      if (sender.isEmpty || content.isEmpty || sender.toLowerCase() == "whatsapp") return;
-
-      final lowerContent = content.toLowerCase();
-      if (_ignorePatterns.any((pattern) => lowerContent.contains(pattern))) return;
-      if (RegExp(r'^\d+\s+new\s+messages?$', caseSensitive: false).hasMatch(lowerContent)) return;
-
-      if (event.canReply == true) {
-        _replyCache[sender] = event;
-      }
-
-      if (_deleteTriggers.any((trigger) => lowerContent.contains(trigger))) {
-        await DBHelper.instance.markLatestAsDeleted(sender, pkg);
-        await _refreshLists();
-        return;
-      }
-
-      await DBHelper.instance.insertMessage(
-        sender: sender,
-        content: content,
-        packageName: pkg,
-      );
-      await _refreshLists();
-    });
+  /// Pulls everything the native side captured (also while the app was closed)
+  /// out of the encrypted queue into the vault, then refreshes the lists.
+  Future<void> _drainAndRefresh() async {
+    try {
+      await CaptureBridge.drain();
+    } catch (e) {
+      // Vault not openable: events stay queued; _refreshLists shows the banner.
+      debugPrint("Vesper: queue drain failed: $e");
+    }
+    await _refreshLists();
   }
 
   Future<void> _refreshLists() async {
@@ -295,8 +279,10 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
       final del = await DBHelper.instance.fetchMessages(onlyDeleted: true);
       final media = await DBHelper.instance.fetchMedia();
       final statusCount = await DBHelper.instance.countSavedStatuses();
+      final replyable = await CaptureBridge.replyableChats();
       if (mounted) {
         setState(() {
+          _replyableChats = replyable;
           _allMessages = all;
           _deletedMessages = del;
           _mediaList = media;
@@ -345,6 +331,9 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
 
     if (!confirmed) return;
     try {
+      try {
+        await CaptureBridge.clearCaptureState();
+      } catch (_) {}
       await DBHelper.instance.resetVault();
       try {
         await _mediaWatcher.deleteAllBackedUpMedia();
@@ -393,7 +382,10 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
     bool mediaFullyRemoved = true;
     bool statusesFullyRemoved = true;
     try {
-      _mediaWatcher.stopWatching();
+      // Native first: drops queued events + chat snapshots and moves the media
+      // cutoff to "now" (serialised with any in-flight copy), so nothing that
+      // was just wiped is re-imported.
+      await CaptureBridge.clearCaptureState();
       mediaFullyRemoved = await _mediaWatcher.deleteAllBackedUpMedia();
       statusesFullyRemoved = await _statusSaver.deleteAllSavedStatusFiles();
       await DBHelper.instance.clearAllData();
@@ -407,11 +399,6 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
         );
       }
       return;
-    } finally {
-      // Resume watching so future deletions are still tracked.
-      if (_hasStoragePerm) {
-        await _mediaWatcher.startWatching(onMediaUpdate: _refreshLists);
-      }
     }
 
     if (mounted) {
@@ -429,7 +416,7 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
     }
   }
 
-  void _showGhostReplyDialog(String sender, ServiceNotificationEvent event) {
+  void _showGhostReplyDialog(String sender, String chatKey) {
     final TextEditingController replyCtrl = TextEditingController();
     showDialog(
       context: context,
@@ -453,13 +440,17 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
             onPressed: () async {
               final text = replyCtrl.text.trim();
               if (text.isNotEmpty) {
-                await event.sendReply(text);
+                final ok = await CaptureBridge.sendReply(chatKey, text);
                 if (ctx.mounted) {
                   Navigator.pop(ctx);
                 }
                 if (mounted) {
                   ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(content: Text("Ghost Reply Sent Successfully!")),
+                    SnackBar(
+                      content: Text(ok
+                          ? "Ghost Reply Sent Successfully!"
+                          : "Reply not available any more - the chat notification is gone."),
+                    ),
                   );
                 }
               }
@@ -598,10 +589,14 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
         final msg = list[index];
         final bool isDeleted = msg['is_deleted'] == 1;
         final String sender = msg['sender'];
+        final String? chatKey = msg['chat_key'] as String?;
+        final String? chatTitle = msg['chat_title'] as String?;
+        final String displayName =
+            (chatTitle != null && chatTitle.isNotEmpty && chatTitle != sender) ? "$sender · $chatTitle" : sender;
         final timeStr = DateFormat('hh:mm a, dd MMM').format(
           DateTime.fromMillisecondsSinceEpoch(msg['timestamp']),
         );
-        final canGhostReply = _replyCache.containsKey(sender);
+        final canGhostReply = chatKey != null && _replyableChats.contains(chatKey);
 
         return Card(
           margin: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
@@ -619,7 +614,7 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
                 Expanded(
-                  child: Text(sender, style: const TextStyle(fontWeight: FontWeight.bold), overflow: TextOverflow.ellipsis),
+                  child: Text(displayName, style: const TextStyle(fontWeight: FontWeight.bold), overflow: TextOverflow.ellipsis),
                 ),
                 if (isDeleted)
                   Container(
@@ -642,7 +637,7 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
                 ? IconButton(
                     icon: const Icon(Icons.reply, color: Color(0xFF00A884)),
                     tooltip: "Ghost Reply (No Blue Tick)",
-                    onPressed: () => _showGhostReplyDialog(sender, _replyCache[sender]!),
+                    onPressed: () => _showGhostReplyDialog(sender, chatKey),
                   )
                 : null,
           ),
@@ -674,15 +669,26 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
         final item = _mediaList[index];
         final File imgFile = File(item['saved_path']);
         final bool isDeleted = item['is_deleted_by_sender'] == 1;
+        final bool isVideo = item['media_type'] == 'video';
 
         return Stack(
           fit: StackFit.expand,
           children: [
             ClipRRect(
               borderRadius: BorderRadius.circular(10),
-              child: imgFile.existsSync()
-                  ? Image.file(imgFile, fit: BoxFit.cover)
-                  : const Center(child: Icon(Icons.broken_image)),
+              child: !imgFile.existsSync()
+                  ? const Center(child: Icon(Icons.broken_image))
+                  : isVideo
+                      ? Container(
+                          color: const Color(0xFF1F2C34),
+                          child: const Center(child: Icon(Icons.play_circle_outline, size: 48)),
+                        )
+                      : Image.file(
+                          imgFile,
+                          fit: BoxFit.cover,
+                          cacheWidth: 400,
+                          errorBuilder: (_, __, ___) => const Center(child: Icon(Icons.broken_image)),
+                        ),
             ),
             if (isDeleted)
               Positioned(
@@ -691,7 +697,8 @@ class _HomeScreenState extends State<HomeScreen> with SingleTickerProviderStateM
                 child: Container(
                   padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
                   decoration: BoxDecoration(color: Colors.redAccent, borderRadius: BorderRadius.circular(6)),
-                  child: const Text("DELETED BY SENDER", style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold)),
+                  // Vesper only knows the file left WhatsApp's folder, not who removed it.
+                  child: const Text("REMOVED FROM WHATSAPP", style: TextStyle(fontSize: 10, fontWeight: FontWeight.bold)),
                 ),
               ),
           ],

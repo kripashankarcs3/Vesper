@@ -41,10 +41,12 @@
         <meta-data
             android:name="flutterEmbedding"
             android:value="2" />
-        <!-- Notification Listener Service binding -->
+        <!-- Vesper's own notification listener (replaces the notification_listener_service
+             plugin). Captures WhatsApp MessagingStyle notifications natively, even while
+             the Flutter engine is not running, and hosts the native media watcher. -->
         <service
-            android:label="notifications"
-            android:name="notification.listener.service.NotificationListener"
+            android:label="Vesper capture"
+            android:name=".CaptureListenerService"
             android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE"
             android:exported="true">
             <intent-filter>
