@@ -66,7 +66,7 @@ class DBHelper {
     return await openDatabase(
       path,
       password: encryptionPassword, // AES-256 SQLCipher Encryption Active
-      version: 2,
+      version: 3,
       onCreate: _createDB,
       onUpgrade: _upgradeDB,
     );
@@ -103,6 +103,7 @@ class DBHelper {
     _keyProvider.invalidate();
   }
 
+  /// Builds the full, current (v3) schema for a brand-new vault.
   Future<void> _createDB(Database db, int version) async {
     await db.execute('''
       CREATE TABLE messages (
@@ -111,9 +112,13 @@ class DBHelper {
         content TEXT NOT NULL,
         package_name TEXT NOT NULL,
         timestamp INTEGER NOT NULL,
-        is_deleted INTEGER NOT NULL DEFAULT 0
+        is_deleted INTEGER NOT NULL DEFAULT 0,
+        msg_uid TEXT,
+        chat_key TEXT,
+        chat_title TEXT
       )
     ''');
+    await _createMessageIndexes(db);
 
     await db.execute('''
       CREATE TABLE media_vault (
@@ -130,10 +135,36 @@ class DBHelper {
   }
 
   /// Non-destructive migrations. Existing tables and rows are never dropped.
+  /// sqflite runs onUpgrade inside one transaction, so a failed step rolls back
+  /// and the version is not bumped.
   Future<void> _upgradeDB(Database db, int oldVersion, int newVersion) async {
     if (oldVersion < 2) {
       await _createStatusVaultTable(db);
     }
+    if (oldVersion < 3) {
+      // v3: native capture. Existing rows keep NULL in the new columns; NULLs
+      // never collide in a UNIQUE index.
+      final cols = (await db.rawQuery('PRAGMA table_info(messages)'))
+          .map((r) => r['name'] as String)
+          .toSet();
+      if (!cols.contains('msg_uid')) {
+        await db.execute('ALTER TABLE messages ADD COLUMN msg_uid TEXT');
+      }
+      if (!cols.contains('chat_key')) {
+        await db.execute('ALTER TABLE messages ADD COLUMN chat_key TEXT');
+      }
+      if (!cols.contains('chat_title')) {
+        await db.execute('ALTER TABLE messages ADD COLUMN chat_title TEXT');
+      }
+      await _createMessageIndexes(db);
+    }
+  }
+
+  Future<void> _createMessageIndexes(DatabaseExecutor db) async {
+    await db.execute(
+        'CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_msg_uid ON messages(msg_uid)');
+    await db.execute(
+        'CREATE INDEX IF NOT EXISTS idx_messages_chat_sender ON messages(chat_key, sender, timestamp)');
   }
 
   Future<void> _createStatusVaultTable(DatabaseExecutor db) async {
@@ -150,56 +181,81 @@ class DBHelper {
     ''');
   }
 
-  Future<int?> insertMessage({
-    required String sender,
-    required String content,
-    required String packageName,
-  }) async {
+  /// Applies native capture events (from the encrypted queue) in ONE
+  /// transaction. Every event is idempotent, so replaying a batch (e.g. after a
+  /// crash before the queue was acked) changes nothing. Returns the number of
+  /// rows changed.
+  Future<int> applyCaptureEvents(List<Map<String, dynamic>> events) async {
+    if (events.isEmpty) return 0;
     final db = await instance.database;
-    final now = DateTime.now().millisecondsSinceEpoch;
-
-    final recentDupes = await db.query(
-      'messages',
-      where: 'sender = ? AND content = ? AND (? - timestamp) < 3000',
-      whereArgs: [sender, content, now],
-    );
-
-    if (recentDupes.isNotEmpty) return null;
-
-    return await db.insert('messages', {
-      'sender': sender,
-      'content': content,
-      'package_name': packageName,
-      'timestamp': now,
-      'is_deleted': 0,
+    var changed = 0;
+    await db.transaction((txn) async {
+      for (final e in events) {
+        switch (e['type']) {
+          case 'msg':
+            final id = await txn.insert(
+              'messages',
+              {
+                'sender': e['sender'] as String? ?? '',
+                'content': e['text'] as String? ?? '',
+                'package_name': e['pkg'] as String? ?? '',
+                'timestamp': (e['ts'] as num?)?.toInt() ?? DateTime.now().millisecondsSinceEpoch,
+                'is_deleted': 0,
+                'msg_uid': e['uid'] as String?,
+                'chat_key': e['chatKey'] as String?,
+                'chat_title': (e['isGroup'] == true) ? e['chatTitle'] as String? : null,
+              },
+              conflictAlgorithm: ConflictAlgorithm.ignore,
+            );
+            if (id > 0) changed++;
+          case 'del':
+            changed += await txn.update(
+              'messages',
+              {'is_deleted': 1},
+              where: 'msg_uid = ? AND is_deleted = 0',
+              whereArgs: [e['uid']],
+            );
+          case 'del_latest':
+            final res = await txn.query(
+              'messages',
+              columns: ['id'],
+              where: 'chat_key = ? AND sender = ? AND is_deleted = 0 AND timestamp <= ?',
+              whereArgs: [e['chatKey'], e['sender'], (e['beforeTs'] as num?)?.toInt() ?? 0],
+              orderBy: 'timestamp DESC, id DESC',
+              limit: 1,
+            );
+            if (res.isNotEmpty) {
+              changed += await txn.update('messages', {'is_deleted': 1},
+                  where: 'id = ?', whereArgs: [res.first['id']]);
+            }
+          case 'media':
+            final name = e['fileName'] as String?;
+            if (name == null) break;
+            final exists = await txn.query('media_vault',
+                columns: ['id'], where: 'file_name = ?', whereArgs: [name], limit: 1);
+            if (exists.isEmpty) {
+              await txn.insert('media_vault', {
+                'file_name': name,
+                'saved_path': e['savedPath'] as String? ?? '',
+                'media_type': e['mediaType'] as String? ?? 'image',
+                'timestamp': (e['ts'] as num?)?.toInt() ?? DateTime.now().millisecondsSinceEpoch,
+                'is_deleted_by_sender': 0,
+              });
+              changed++;
+            }
+          case 'media_del':
+            changed += await txn.update(
+              'media_vault',
+              {'is_deleted_by_sender': 1},
+              where: 'file_name = ? AND is_deleted_by_sender = 0',
+              whereArgs: [e['fileName']],
+            );
+          default:
+            break; // unknown event types from a newer native side are skipped
+        }
+      }
     });
-  }
-
-  Future<bool> markLatestAsDeleted(String sender, String packageName) async {
-    final db = await instance.database;
-
-    // Scope the match to the SAME sender AND the SAME app (package). Without the
-    // package filter, a "deleted" event from WhatsApp could revoke a message in
-    // a same-named WhatsApp Business conversation (or vice-versa).
-    final res = await db.query(
-      'messages',
-      where: 'sender = ? AND package_name = ? AND is_deleted = 0',
-      whereArgs: [sender, packageName],
-      orderBy: 'timestamp DESC',
-      limit: 1,
-    );
-
-    if (res.isNotEmpty) {
-      final int targetId = res.first['id'] as int;
-      await db.update(
-        'messages',
-        {'is_deleted': 1},
-        where: 'id = ?',
-        whereArgs: [targetId],
-      );
-      return true;
-    }
-    return false;
+    return changed;
   }
 
   Future<List<Map<String, dynamic>>> fetchMessages({bool onlyDeleted = false}) async {
@@ -209,31 +265,6 @@ class DBHelper {
       where: onlyDeleted ? 'is_deleted = 1' : null,
       orderBy: 'timestamp DESC',
       limit: 300,
-    );
-  }
-
-  Future<void> insertMedia({
-    required String fileName,
-    required String savedPath,
-    required String mediaType,
-  }) async {
-    final db = await instance.database;
-    await db.insert('media_vault', {
-      'file_name': fileName,
-      'saved_path': savedPath,
-      'media_type': mediaType,
-      'timestamp': DateTime.now().millisecondsSinceEpoch,
-      'is_deleted_by_sender': 0,
-    });
-  }
-
-  Future<void> markMediaDeleted(String fileName) async {
-    final db = await instance.database;
-    await db.update(
-      'media_vault',
-      {'is_deleted_by_sender': 1},
-      where: 'file_name = ?',
-      whereArgs: [fileName],
     );
   }
 
