@@ -80,15 +80,6 @@ tool/generate_icon.py  Generates the logo and icon images
 assets/branding/       Logo and icon source images
 ```
 
-## Logo
-
-The logo shows an evening star (*vesper*) inside a shield, with a **V** at the bottom: a star that keeps watch over your vault. To regenerate the images and launcher icons:
-
-```bash
-python tool/generate_icon.py
-dart run flutter_launcher_icons
-```
-
 ## Disclaimer
 
 Vesper is an independent personal project. It is not affiliated with, endorsed by or connected to WhatsApp or Meta. Use it only on your own device and respect the privacy of the people you chat with.
